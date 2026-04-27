@@ -1,0 +1,4 @@
+dataset,gamma_fixed_global,gamma_fixed_groupwise,gg_gpboost,gg_gpboost_boosted
+fremtpl,0.8545454545454545,0.8545454545454545,0.8545454545454545,0.6
+sandp500,3.4,3.4,3.4,0.6
+us_fundamentals_assets,3.4,3.4,3.4,0.6

@@ -1,0 +1,24 @@
+.DS_Store
+.vscode/
+__pycache__/
+*.pyc
+
+Backups/
+*.zip
+
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.run.xml
+*.synctex.gz
+*.toc
+
+Useful.txt
+Gamma_Gamma/datasets/
+Poisson_Gamma/data/
