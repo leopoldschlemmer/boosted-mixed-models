@@ -785,7 +785,7 @@ def load_us_fundamentals(
     return x, y, g
 
 
-def load_zillow(base_dir, max_rows=120000):
+def load_zillow(base_dir, max_rows=120000, max_obs_per_group=ZILLOW_MAX_OBS_PER_GROUP):
     df = pd.read_csv(os.path.join(base_dir, "Metro_zhvi_uc_sfrcondo_tier_0.33_0.67_sm_sa_month.csv"))
     id_cols = ["RegionID", "SizeRank", "RegionName", "RegionType", "StateName"]
     date_cols = [c for c in df.columns if c[:4].isdigit()]
@@ -814,7 +814,7 @@ def load_zillow(base_dir, max_rows=120000):
         long_df,
         "RegionID",
         "date",
-        max_obs_per_group=ZILLOW_MAX_OBS_PER_GROUP,
+        max_obs_per_group=max_obs_per_group,
         seed=SEED,
     )
     if len(long_df) > max_rows:
@@ -838,7 +838,7 @@ def load_zillow(base_dir, max_rows=120000):
     return x, y, g
 
 
-def load_airbnb_nyc(base_dir, max_rows=120000):
+def load_airbnb_nyc(base_dir, max_rows=120000, max_obs_per_group=AIRBNB_NYC_MAX_OBS_PER_GROUP):
     df = pd.read_csv(os.path.join(base_dir, "AB_NYC_2019.csv"))
     required = [
         "host_id", "neighbourhood_group", "neighbourhood", "latitude", "longitude",
@@ -851,7 +851,7 @@ def load_airbnb_nyc(base_dir, max_rows=120000):
     df = cap_observations_per_group(
         df,
         "neighbourhood",
-        max_obs_per_group=AIRBNB_NYC_MAX_OBS_PER_GROUP,
+        max_obs_per_group=max_obs_per_group,
         seed=SEED,
     )
     if len(df) > max_rows:
@@ -887,13 +887,19 @@ DATASETS = {
         max_obs_per_group=8,
     ),
     "zillow": lambda base: load_zillow(os.path.join(base, "zillow")),
+    "zillow_cap8": lambda base: load_zillow(os.path.join(base, "zillow"), max_obs_per_group=8),
     "airbnb_nyc": lambda base: load_airbnb_nyc(os.path.join(base, "New York City Airbnb Open Data")),
+    "airbnb_nyc_cap8": lambda base: load_airbnb_nyc(
+        os.path.join(base, "New York City Airbnb Open Data"),
+        max_obs_per_group=8,
+    ),
 }
 
 CONSECUTIVE_SPLIT_DATASETS = {
     "us_fundamentals_assets",
     "us_fundamentals_assets_balanced4_8",
     "zillow",
+    "zillow_cap8",
 }
 
 
