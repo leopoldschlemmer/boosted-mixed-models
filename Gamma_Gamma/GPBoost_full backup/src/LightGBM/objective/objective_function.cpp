@@ -32,6 +32,9 @@ namespace LightGBM {
 		else if (type == std::string("poisson")) {
 			return new RegressionPoissonLoss(config);
 		}
+		else if (type == std::string("gamma_gamma")) {
+			return new RegressionL2loss(config);
+		}
 		else if (type == std::string("bernoulli_logit") || type == std::string("binary")) {
 			return new BinaryLogloss(config);
 		}
@@ -95,6 +98,9 @@ namespace LightGBM {
 		}
 		else if (type == std::string("poisson")) {
 			return new RegressionPoissonLoss(strs);
+		}
+		else if (type == std::string("gamma_gamma")) {
+			return new RegressionL2loss(strs);
 		}
 		else if (type == std::string("bernoulli_logit") || type == std::string("binary")) {
 			return new BinaryLogloss(strs);
