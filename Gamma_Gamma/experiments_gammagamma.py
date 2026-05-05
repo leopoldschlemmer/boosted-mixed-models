@@ -1,25 +1,19 @@
 import os
-import math
 import sys
 import multiprocessing as mp
 from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import minimize
-from scipy.special import gammaln, logsumexp
-from sklearn.model_selection import GroupKFold
 
 
 SEED = 42
-BOOTSTRAP_B = 200
-ALPHA_GRID = np.linspace(0.5, 10, 30) 
 GG_INIT_ALPHA = 1.0
 RESULTS_DIR = "results"
 SUMMARY_CSV = "real_data_gg_summary.csv"
 USE_OPTUNA = True
 USE_OPTUNA_GG_BOOSTING = True
-RUN_DATASETS_IN_SUBPROCESS = True
+RUN_DATASETS_IN_SUBPROCESS = False
 US_FUNDAMENTALS_MAX_OBS_PER_GROUP = 8
 ZILLOW_MAX_OBS_PER_GROUP = 30
 AIRBNB_NYC_MAX_OBS_PER_GROUP = 15
@@ -56,47 +50,18 @@ def metrics(y_true, y_pred):
     }
 
 
-def bootstrap_group_se(group, stat_fn, B=BOOTSTRAP_B, seed=SEED):
-    group = np.asarray(group)
-    unique_groups = np.unique(group)
-    if len(unique_groups) < 2:
-        return np.nan
-    idx_by_group = {gid: np.flatnonzero(group == gid) for gid in unique_groups}
-    rng = np.random.default_rng(seed)
-    vals = []
-    for _ in range(int(B)):
-        sampled_groups = rng.choice(unique_groups, size=len(unique_groups), replace=True)
-        sampled_idx = []
-        sampled_group = []
-        for new_gid, gid in enumerate(sampled_groups):
-            idx = idx_by_group[gid]
-            sampled_idx.append(idx)
-            sampled_group.append(np.full(len(idx), new_gid, dtype=int))
-        idx = np.concatenate(sampled_idx)
-        boot_group = np.concatenate(sampled_group)
-        val = stat_fn(idx, boot_group)
-        if np.isfinite(val):
-            vals.append(float(val))
-    if len(vals) < 2:
-        return np.nan
-    return float(np.std(vals, ddof=1))
+def fold_metric_ses(fold_values):
+    vals = pd.DataFrame(fold_values)
+    out = {}
+    for col in ("rmse", "mae"):
+        values = pd.to_numeric(vals[col], errors="coerce").to_numpy(dtype=float)
+        values = values[np.isfinite(values)]
+        out[f"{col}_se"] = float(np.std(values) / np.sqrt(values.size)) if values.size > 1 else np.nan
+    return out
 
 
-def summarize_prediction_metrics(y_true, y_pred, group):
-    vals = metrics(y_true, y_pred)
-    vals["rmse_se"] = bootstrap_group_se(
-        group,
-        lambda idx, _: metrics(y_true[idx], y_pred[idx])["rmse"],
-    )
-    vals["mae_se"] = bootstrap_group_se(
-        group,
-        lambda idx, _: metrics(y_true[idx], y_pred[idx])["mae"],
-    )
-    vals["corr_se"] = bootstrap_group_se(
-        group,
-        lambda idx, _: metrics(y_true[idx], y_pred[idx])["corr"],
-    )
-    return vals
+def summarize_prediction_metrics(y_true, y_pred):
+    return metrics(y_true, y_pred)
 
 
 def format_estimate_with_se(value, se, digits=5):
@@ -170,142 +135,6 @@ def split_within_groups(group, test_size=0.2, seed=SEED, consecutive=False):
         test_idx.extend(np.asarray(chosen).tolist())
         train_idx.extend([i for i in idx.tolist() if i not in chosen_set])
     return np.array(train_idx, dtype=int), np.array(test_idx, dtype=int)
-
-
-def posterior_group_stats(group, y, f, alpha, delta):
-    uniq, inv = np.unique(group, return_inverse=True)
-    n_i = np.bincount(inv).astype(float)
-    s_i = np.bincount(inv, weights=np.exp(f) * y).astype(float)
-    shape = delta + n_i * alpha
-    rate = delta + s_i
-    return shape, rate, {gid: i for i, gid in enumerate(uniq)}
-
-
-def predict_grouped_from_beta(x, group, beta, alpha, shape, rate, id_to_idx, delta):
-    return predict_grouped_from_f(x @ beta, group, alpha, shape, rate, id_to_idx, delta)
-
-
-def predict_grouped_from_f(f, group, alpha, shape, rate, id_to_idx, delta):
-    pred = np.empty(len(group), dtype=float)
-    for i, gid in enumerate(group):
-        if gid in id_to_idx:
-            k = shape[id_to_idx[gid]]
-            r = rate[id_to_idx[gid]]
-        else:
-            k = delta
-            r = delta
-        pred[i] = alpha * np.exp(-f[i]) * r / max(k - 1.0, 1e-12)
-    return pred
-
-
-def gamma_fe_objective(beta, x, y, alpha):
-    f = x @ beta
-    return float(np.sum(math.lgamma(alpha) - alpha * f - (alpha - 1.0) * np.log(y) + np.exp(f) * y))
-
-
-def gamma_fe_grad(beta, x, y, alpha):
-    f = x @ beta
-    return x.T @ (-alpha + np.exp(f) * y)
-
-
-def gamma_fe_test_nll(y, f, alpha):
-    y = np.asarray(y, dtype=float)
-    f = np.asarray(f, dtype=float)
-    return float(np.sum(gammaln(alpha) - alpha * f - (alpha - 1.0) * np.log(y) + np.exp(f) * y))
-
-
-def grouped_gg_test_nll(y, group, f, alpha, delta):
-    y = np.asarray(y, dtype=float)
-    group = np.asarray(group)
-    f = np.asarray(f, dtype=float)
-    _, inv = np.unique(group, return_inverse=True)
-    n_i = np.bincount(inv).astype(float)
-    sum_f = np.bincount(inv, weights=f).astype(float)
-    sum_log_y = np.bincount(inv, weights=np.log(y)).astype(float)
-    sum_exp_f_y = np.bincount(inv, weights=np.exp(f) * y).astype(float)
-    return float(np.sum(
-        n_i * gammaln(alpha)
-        - delta * np.log(delta)
-        + gammaln(delta)
-        - gammaln(delta + n_i * alpha)
-        - alpha * sum_f
-        - (alpha - 1.0) * sum_log_y
-        + (delta + n_i * alpha) * np.log(delta + sum_exp_f_y)
-    ))
-
-
-def gamma_normal_mc_test_nll(y, latent_mean, latent_var, alpha, n_samples=4096, seed=SEED, chunk_size=512):
-    y = np.asarray(y, dtype=float)
-    latent_mean = np.asarray(latent_mean, dtype=float)
-    latent_var = np.maximum(np.asarray(latent_var, dtype=float), 0.0)
-    alpha = float(alpha)
-    if len(y) == 0 or not np.isfinite(alpha) or alpha <= 0:
-        return np.nan
-
-    rng = np.random.default_rng(seed)
-    half_samples = max(1, int(np.ceil(n_samples / 2)))
-    log_alpha = np.log(alpha)
-    const = alpha * log_alpha - gammaln(alpha)
-    nll = 0.0
-    for start in range(0, len(y), chunk_size):
-        end = min(start + chunk_size, len(y))
-        eps = rng.normal(size=(end - start, half_samples))
-        eps = np.concatenate([eps, -eps], axis=1)[:, :n_samples]
-        z = latent_mean[start:end, None] + np.sqrt(latent_var[start:end, None]) * eps
-        yi = y[start:end, None]
-        log_pdf = const - alpha * z + (alpha - 1.0) * np.log(yi) - alpha * yi * np.exp(-z)
-        nll -= float(np.sum(logsumexp(log_pdf, axis=1) - np.log(log_pdf.shape[1])))
-    return nll
-
-
-def fit_global_gamma_fe(x_train, y_train, alpha_grid):
-    beta0 = np.zeros(x_train.shape[1], dtype=float)
-    best = None
-    for alpha in alpha_grid:
-        beta0[0] = -np.log(np.mean(y_train) / float(alpha)) #maybe this is a better initialization
-        opt = minimize(
-            fun=lambda b: gamma_fe_objective(b, x_train, y_train, float(alpha)),
-            x0=beta0,
-            jac=lambda b: gamma_fe_grad(b, x_train, y_train, float(alpha)),
-            method="L-BFGS-B",
-            options={"maxiter": 250},
-        )
-        beta_hat = opt.x if opt.success else beta0
-        negll = gamma_fe_objective(beta_hat, x_train, y_train, float(alpha))
-        if best is None or negll < best["negll"]:
-            best = {"alpha": float(alpha), "beta": beta_hat, "negll": float(negll)}
-    return best
-
-
-def fit_groupwise_gamma_fe(x_train, y_train, g_train, alpha, beta_fallback):
-    models = {}
-    p = x_train.shape[1]
-    for gid in np.unique(g_train):
-        idx = np.flatnonzero(g_train == gid)
-        if len(idx) <= 2:
-            models[int(gid)] = beta_fallback.copy()
-            continue
-        xg = x_train[idx]
-        yg = y_train[idx]
-        beta0 = np.zeros(p, dtype=float)
-        beta0[0] = -np.log(np.mean(yg) / float(alpha))#maybe this is a better initialization than all zeros
-        opt = minimize(
-            fun=lambda b: gamma_fe_objective(b, xg, yg, alpha),
-            x0=beta0,
-            jac=lambda b: gamma_fe_grad(b, xg, yg, alpha),
-            method="L-BFGS-B",
-            options={"maxiter": 120},
-        )
-        models[int(gid)] = (opt.x if opt.success else beta_fallback).copy()
-    return models
-
-
-def predict_groupwise_gamma_fe(x, g, alpha, models, beta_fallback):
-    pred = np.empty(x.shape[0], dtype=float)
-    for i, gid in enumerate(g):
-        beta = models.get(int(gid), beta_fallback)
-        pred[i] = alpha * np.exp(-(x[i] @ beta))
-    return pred
 
 
 def fit_gg_linear(
@@ -535,36 +364,61 @@ def fit_gg_boosted(x_train, y_train, g_train, init_alpha=GG_INIT_ALPHA, num_boos
     }
 
 
-def tune_gg_boosting(x_train, y_train, g_train, init_alpha=GG_INIT_ALPHA, n_trials=8, n_splits=5, max_rounds=200, early_stopping=20):
+def tune_mixed_boosting(x_train, y_train, g_train, likelihood, init_alpha=GG_INIT_ALPHA, n_trials=8, n_splits=5, max_rounds=200, early_stopping=20):
     gpb = import_gpboost()
-    gp_model = gpb.GPModel(
-        group_data=g_train.astype(np.int32, copy=False),
-        likelihood="gamma_gamma",
-        likelihood_additional_param=float(init_alpha),
-        num_data=len(y_train),
-        free_raw_data=False,
-    )
-    gp_model._user_likelihood = "gamma_gamma"
-    gp_model.set_optim_params({
-        "optimizer_cov": "gradient_descent",
-        "optimizer_coef": "gradient_descent",
-        "init_cov_pars": np.array([1.0], dtype=float),
-        "trace": False,
-        "init_aux_pars": np.array([float(init_alpha)], dtype=float),
-        "estimate_aux_pars": True,
-        "lr_cov": 1e-3,
-        "lr_coef": 1e-3,
-    })
-    folds = list(GroupKFold(n_splits=n_splits).split(x_train, y_train, groups=g_train))
-    search_space = {
-        "learning_rate": [0.03, 0.06],
-        "min_data_in_leaf": [8, 20],
-        "max_depth": [1, 1],
-        "num_leaves": [2, 3],
-        "lambda_l2": [0.0, 2.0],
-        "max_bin": [127, 255],
-        "feature_fraction": [0.8, 1.0],
-    }
+    if likelihood == "gamma_gamma":
+        gp_model = gpb.GPModel(
+            group_data=g_train.astype(np.int32, copy=False),
+            likelihood="gamma_gamma",
+            likelihood_additional_param=float(init_alpha),
+            num_data=len(y_train),
+            free_raw_data=False,
+        )
+        gp_model._user_likelihood = "gamma_gamma"
+        gp_model.set_optim_params({
+            "optimizer_cov": "gradient_descent",
+            "optimizer_coef": "gradient_descent",
+            "init_cov_pars": np.array([1.0], dtype=float),
+            "trace": False,
+            "init_aux_pars": np.array([float(init_alpha)], dtype=float),
+            "estimate_aux_pars": True,
+            "lr_cov": 1e-3,
+            "lr_coef": 1e-3,
+        })
+        search_space = {
+            "learning_rate": [0.03, 0.06],
+            "min_data_in_leaf": [8, 20],
+            "max_depth": [1, 1],
+            "num_leaves": [2, 3],
+            "lambda_l2": [0.0, 2.0],
+            "max_bin": [127, 255],
+            "feature_fraction": [0.8, 1.0],
+        }
+        metric = "test_neg_log_likelihood"
+        params = {"objective": "gamma_gamma", "boost_from_average": False, "line_search_step_length": False, "verbose": -1}
+    elif likelihood == "gamma":
+        gp_model = gpb.GPModel(
+            group_data=g_train.astype(np.int32, copy=False),
+            likelihood="gamma",
+            num_data=len(y_train),
+            free_raw_data=False,
+        )
+        gp_model.set_optim_params({"estimate_aux_pars": True})
+        search_space = {
+            "learning_rate": [0.03, 0.08],
+            "min_data_in_leaf": [8, 20],
+            "max_depth": [1, 2],
+            "num_leaves": [2, 6],
+            "lambda_l2": [0.0, 2.0],
+            "max_bin": [127, 255],
+            "feature_fraction": [0.8, 1.0],
+            "line_search_step_length": [False, True],
+        }
+        metric = "gamma"
+        params = {"objective": "gamma", "verbose": -1}
+    else:
+        raise ValueError(f"Unsupported mixed boosting likelihood: {likelihood}")
+    folds = list(within_group_folds(g_train, n_splits=n_splits))
     opt = gpb.tune_pars_TPE_algorithm_optuna(
         search_space=search_space,
         n_trials=int(n_trials),
@@ -574,11 +428,11 @@ def tune_gg_boosting(x_train, y_train, g_train, init_alpha=GG_INIT_ALPHA, n_tria
         max_num_boost_round=int(max_rounds),
         early_stopping_rounds=int(early_stopping),
         folds=folds,
-        metric="test_neg_log_likelihood",
+        metric=metric,
         cv_seed=4,
         tpe_seed=1,
         verbose_eval=1,
-        params={"objective": "gamma_gamma", "boost_from_average": False, "line_search_step_length": False, "verbose": -1},
+        params=params,
         use_gp_model_for_validation=True,
         train_gp_model_cov_pars=True,
     )
@@ -587,9 +441,50 @@ def tune_gg_boosting(x_train, y_train, g_train, init_alpha=GG_INIT_ALPHA, n_tria
     return best_params, best_rounds
 
 
+def tune_gg_boosting_worker(queue, x_train, y_train, g_train, init_alpha, n_trials, n_splits, max_rounds, early_stopping):
+    try:
+        best_params, best_rounds = tune_mixed_boosting(
+            x_train,
+            y_train,
+            g_train,
+            "gamma_gamma",
+            init_alpha,
+            n_trials,
+            n_splits,
+            max_rounds,
+            early_stopping,
+        )
+        queue.put({"ok": True, "best_params": best_params, "best_rounds": best_rounds})
+    except Exception as exc:
+        queue.put({"ok": False, "error": repr(exc)})
+
+
+def tune_gg_boosting(x_train, y_train, g_train, init_alpha=GG_INIT_ALPHA, n_trials=8, n_splits=5, max_rounds=200, early_stopping=20):
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    proc = ctx.Process(
+        target=tune_gg_boosting_worker,
+        args=(queue, x_train, y_train, g_train, init_alpha, n_trials, n_splits, max_rounds, early_stopping),
+    )
+    proc.start()
+    proc.join()
+    if proc.exitcode != 0:
+        raise RuntimeError(f"Gamma-Gamma boosting tuning failed with exit code {proc.exitcode}")
+    result = queue.get()
+    if not result["ok"]:
+        raise RuntimeError(result["error"])
+    return result["best_params"], result["best_rounds"]
+
+
+def tune_gamma_normal_boosting(x_train, y_train, g_train, n_trials=8, n_splits=5, max_rounds=200, early_stopping=20):
+    return tune_mixed_boosting(
+        x_train, y_train, g_train, "gamma", GG_INIT_ALPHA, n_trials, n_splits, max_rounds, early_stopping
+    )
+
+
 def tune_plain_boosting(x_train, y_train, g_train, n_trials=8, n_splits=5, max_rounds=200, early_stopping=20):
     gpb = import_gpboost()
-    folds = list(GroupKFold(n_splits=n_splits).split(x_train, y_train, groups=g_train))
+    folds = list(within_group_folds(g_train, n_splits=n_splits))
     search_space = {
         "learning_rate": [0.03, 0.08],
         "min_data_in_leaf": [8, 20],
@@ -887,19 +782,13 @@ DATASETS = {
         max_obs_per_group=8,
     ),
     "zillow": lambda base: load_zillow(os.path.join(base, "zillow")),
-    "zillow_cap8": lambda base: load_zillow(os.path.join(base, "zillow"), max_obs_per_group=8),
     "airbnb_nyc": lambda base: load_airbnb_nyc(os.path.join(base, "New York City Airbnb Open Data")),
-    "airbnb_nyc_cap8": lambda base: load_airbnb_nyc(
-        os.path.join(base, "New York City Airbnb Open Data"),
-        max_obs_per_group=8,
-    ),
 }
 
 CONSECUTIVE_SPLIT_DATASETS = {
     "us_fundamentals_assets",
     "us_fundamentals_assets_balanced4_8",
     "zillow",
-    "zillow_cap8",
 }
 
 
@@ -926,32 +815,126 @@ def make_split(x, y, g, consecutive=False):
     return SplitData(x_train, y[train_idx], g[train_idx], x_test, y[test_idx], g[test_idx])
 
 
+def within_group_folds(group, n_splits=5, seed=SEED):
+    rng = np.random.default_rng(seed)
+    all_idx = np.arange(len(group), dtype=int)
+    fold_valid = [[] for _ in range(n_splits)]
+    for gid in np.unique(group):
+        idx = np.flatnonzero(group == gid)
+        if len(idx) < 2:
+            continue
+        idx = rng.permutation(idx)
+        for fold_id, part in enumerate(np.array_split(idx, min(n_splits, len(idx)))):
+            if len(part):
+                fold_valid[fold_id].extend(part.tolist())
+    for valid in fold_valid:
+        if not valid:
+            continue
+        valid_idx = np.asarray(sorted(valid), dtype=int)
+        train_idx = np.setdiff1d(all_idx, valid_idx, assume_unique=True)
+        yield train_idx, valid_idx
+
+
+def cv_rmse_mae_se(split, predict_fold_fn, n_splits=5):
+    fold_values = []
+    for train_idx, valid_idx in within_group_folds(split.g_train, n_splits=n_splits):
+        pred = predict_fold_fn(train_idx, valid_idx)
+        fold_values.append(metrics(split.y_train[valid_idx], pred))
+    return fold_metric_ses(fold_values)
+
+
+def gg_boosted_eval_worker(queue, x_train, y_train, g_train, x_eval, y_eval, g_eval, boost_kwargs):
+    try:
+        model = fit_gg_boosted(x_train, y_train, g_train, **boost_kwargs)
+        pred = np.asarray(
+            model["booster"].predict(
+                data=x_eval.astype(np.float64, copy=False),
+                group_data_pred=g_eval.astype(np.int32, copy=False),
+                pred_latent=False,
+            )["response_mean"],
+            dtype=float,
+        ).reshape(-1)
+        queue.put({"ok": True, "alpha": model["alpha"], "metrics": metrics(y_eval, pred)})
+    except Exception as exc:
+        queue.put({"ok": False, "error": repr(exc)})
+
+
+def eval_gg_boosted_isolated(x_train, y_train, g_train, x_eval, y_eval, g_eval, boost_kwargs):
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    proc = ctx.Process(
+        target=gg_boosted_eval_worker,
+        args=(queue, x_train, y_train, g_train, x_eval, y_eval, g_eval, boost_kwargs),
+    )
+    proc.start()
+    proc.join()
+    if proc.exitcode != 0:
+        raise RuntimeError(f"Gamma-Gamma boosted fit failed with exit code {proc.exitcode}")
+    result = queue.get()
+    if not result["ok"]:
+        raise RuntimeError(result["error"])
+    return result
+
+
+def gg_boosted_cv_rmse_mae_se(split, boost_kwargs, n_splits=5):
+    fold_values = []
+    for train_idx, valid_idx in within_group_folds(split.g_train, n_splits=n_splits):
+        result = eval_gg_boosted_isolated(
+            split.x_train[train_idx],
+            split.y_train[train_idx],
+            split.g_train[train_idx],
+            split.x_train[valid_idx],
+            split.y_train[valid_idx],
+            split.g_train[valid_idx],
+            boost_kwargs,
+        )
+        fold_values.append(result["metrics"])
+    return fold_metric_ses(fold_values)
+
+
+def boost_kwargs_from_params(best_params, best_rounds):
+    return {
+        "num_boost_round": best_rounds,
+        "learning_rate": float(best_params.get("learning_rate", 0.05)),
+        "tree_params": {
+            "num_leaves": int(best_params.get("num_leaves", 3)),
+            "min_data_in_leaf": int(best_params.get("min_data_in_leaf", 10)),
+            "max_depth": int(best_params.get("max_depth", 1)),
+            "lambda_l2": float(best_params.get("lambda_l2", 0.0)),
+            "max_bin": int(best_params.get("max_bin", 255)),
+            "feature_fraction": float(best_params.get("feature_fraction", 1.0)),
+            "line_search_step_length": bool(best_params.get("line_search_step_length", False)),
+        },
+    }
+
+
 def run_models(split):
     rows = []
 
-    boost_kwargs = {}
+    gg_boost_kwargs = {}
+    gamma_normal_boost_kwargs = {}
+    plain_boost_kwargs = {}
     if USE_OPTUNA and USE_OPTUNA_GG_BOOSTING:
         best_params, best_rounds = tune_gg_boosting(
             split.x_train,
             split.y_train,
             split.g_train,
         )
-        boost_kwargs = {
-            "num_boost_round": best_rounds,
-            "learning_rate": float(best_params.get("learning_rate", 0.05)),
-            "tree_params": {
-                "num_leaves": int(best_params.get("num_leaves", 3)),
-                "min_data_in_leaf": int(best_params.get("min_data_in_leaf", 10)),
-                "max_depth": int(best_params.get("max_depth", 1)),
-                "lambda_l2": float(best_params.get("lambda_l2", 0.0)),
-                "max_bin": int(best_params.get("max_bin", 255)),
-                "feature_fraction": float(best_params.get("feature_fraction", 1.0)),
-                "line_search_step_length": bool(best_params.get("line_search_step_length", False)),
-            },
-        }
+        gg_boost_kwargs = boost_kwargs_from_params(best_params, best_rounds)
+        best_params, best_rounds = tune_gamma_normal_boosting(
+            split.x_train,
+            split.y_train,
+            split.g_train,
+        )
+        gamma_normal_boost_kwargs = boost_kwargs_from_params(best_params, best_rounds)
+        best_params, best_rounds = tune_plain_boosting(
+            split.x_train,
+            split.y_train,
+            split.g_train,
+        )
+        plain_boost_kwargs = boost_kwargs_from_params(best_params, best_rounds)
 
     gg_linear = fit_gg_linear(split.x_train, split.y_train, split.g_train)
-    f_test_linear = split.x_test @ gg_linear["beta"]
     pred = np.asarray(
         gg_linear["gp_model"].predict(
             group_data_pred=split.g_test.astype(np.int32, copy=False),
@@ -960,10 +943,22 @@ def run_models(split):
         )["mu"],
         dtype=float,
     ).reshape(-1)
-    pred_metrics = summarize_prediction_metrics(split.y_test, pred, split.g_test)
-    gg_linear_test_nll = grouped_gg_test_nll(
-        split.y_test, split.g_test, f_test_linear, gg_linear["alpha"], gg_linear["delta"]
-    )
+    pred_metrics = summarize_prediction_metrics(split.y_test, pred)
+    pred_metrics.update(cv_rmse_mae_se(
+        split,
+        lambda train_idx, valid_idx: np.asarray(
+            fit_gg_linear(
+                split.x_train[train_idx],
+                split.y_train[train_idx],
+                split.g_train[train_idx],
+            )["gp_model"].predict(
+                group_data_pred=split.g_train[valid_idx].astype(np.int32, copy=False),
+                X_pred=split.x_train[valid_idx].astype(np.float64, copy=False),
+                predict_response=True,
+            )["mu"],
+            dtype=float,
+        ).reshape(-1),
+    ))
     rows.append({
         "model": "gg_gpboost",
         "alpha_hat": gg_linear["alpha"],
@@ -972,14 +967,7 @@ def run_models(split):
         "mae": pred_metrics["mae"],
         "mae_se": pred_metrics["mae_se"],
         "corr": pred_metrics["corr"],
-        "corr_se": pred_metrics["corr_se"],
-        "test_nll": gg_linear_test_nll,
-        "test_nll_se": bootstrap_group_se(
-            split.g_test,
-            lambda idx, boot_group: grouped_gg_test_nll(
-                split.y_test[idx], boot_group, f_test_linear[idx], gg_linear["alpha"], gg_linear["delta"]
-            ),
-        ),
+        "corr_se": np.nan,
     })
 
     gamma_normal = fit_gamma_normal_linear(split.x_train, split.y_train, split.g_train)
@@ -991,19 +979,22 @@ def run_models(split):
         )["mu"],
         dtype=float,
     ).reshape(-1)
-    latent_gamma_normal = gamma_normal["gp_model"].predict(
-        group_data_pred=split.g_test.astype(np.int32, copy=False),
-        X_pred=split.x_test.astype(np.float64, copy=False),
-        predict_response=False,
-        predict_var=True,
-    )
-    pred_metrics = summarize_prediction_metrics(split.y_test, pred_gamma_normal, split.g_test)
-    gamma_normal_test_nll = gamma_normal_mc_test_nll(
-        split.y_test,
-        np.asarray(latent_gamma_normal["mu"], dtype=float).reshape(-1),
-        np.asarray(latent_gamma_normal["var"], dtype=float).reshape(-1),
-        gamma_normal["alpha"],
-    )
+    pred_metrics = summarize_prediction_metrics(split.y_test, pred_gamma_normal)
+    pred_metrics.update(cv_rmse_mae_se(
+        split,
+        lambda train_idx, valid_idx: np.asarray(
+            fit_gamma_normal_linear(
+                split.x_train[train_idx],
+                split.y_train[train_idx],
+                split.g_train[train_idx],
+            )["gp_model"].predict(
+                group_data_pred=split.g_train[valid_idx].astype(np.int32, copy=False),
+                X_pred=split.x_train[valid_idx].astype(np.float64, copy=False),
+                predict_response=True,
+            )["mu"],
+            dtype=float,
+        ).reshape(-1),
+    ))
     rows.append({
         "model": "gamma_normal_gpboost",
         "alpha_hat": gamma_normal["alpha"],
@@ -1012,41 +1003,20 @@ def run_models(split):
         "mae": pred_metrics["mae"],
         "mae_se": pred_metrics["mae_se"],
         "corr": pred_metrics["corr"],
-        "corr_se": pred_metrics["corr_se"],
-        "test_nll": gamma_normal_test_nll,
-        "test_nll_se": bootstrap_group_se(
-            split.g_test,
-            lambda idx, _: gamma_normal_mc_test_nll(
-                split.y_test[idx],
-                np.asarray(latent_gamma_normal["mu"], dtype=float).reshape(-1)[idx],
-                np.asarray(latent_gamma_normal["var"], dtype=float).reshape(-1)[idx],
-                gamma_normal["alpha"],
-            ),
-        ),
+        "corr_se": np.nan,
     })
 
-    gg_boosted = fit_gg_boosted(split.x_train, split.y_train, split.g_train, **boost_kwargs)
-    f_test = np.asarray(
-        gg_boosted["booster"].predict(
-            data=split.x_test.astype(np.float64, copy=False),
-            group_data_pred=split.g_test.astype(np.int32, copy=False),
-            pred_latent=True,
-            ignore_gp_model=True,
-        ),
-        dtype=float,
-    ).reshape(-1)
-    pred_b = np.asarray(
-        gg_boosted["booster"].predict(
-            data=split.x_test.astype(np.float64, copy=False),
-            group_data_pred=split.g_test.astype(np.int32, copy=False),
-            pred_latent=False,
-        )["response_mean"],
-        dtype=float,
-    ).reshape(-1)
-    pred_metrics = summarize_prediction_metrics(split.y_test, pred_b, split.g_test)
-    gg_boosted_test_nll = grouped_gg_test_nll(
-        split.y_test, split.g_test, f_test, gg_boosted["alpha"], gg_boosted["delta"]
+    gg_boosted = eval_gg_boosted_isolated(
+        split.x_train,
+        split.y_train,
+        split.g_train,
+        split.x_test,
+        split.y_test,
+        split.g_test,
+        gg_boost_kwargs,
     )
+    pred_metrics = gg_boosted["metrics"]
+    pred_metrics.update(gg_boosted_cv_rmse_mae_se(split, gg_boost_kwargs))
     rows.append({
         "model": "gg_gpboost_boosted",
         "alpha_hat": gg_boosted["alpha"],
@@ -1055,21 +1025,14 @@ def run_models(split):
         "mae": pred_metrics["mae"],
         "mae_se": pred_metrics["mae_se"],
         "corr": pred_metrics["corr"],
-        "corr_se": pred_metrics["corr_se"],
-        "test_nll": gg_boosted_test_nll,
-        "test_nll_se": bootstrap_group_se(
-            split.g_test,
-            lambda idx, boot_group: grouped_gg_test_nll(
-                split.y_test[idx], boot_group, f_test[idx], gg_boosted["alpha"], gg_boosted["delta"]
-            ),
-        ),
+        "corr_se": np.nan,
     })
 
     gamma_normal_boosted = fit_gamma_normal_boosted(
         split.x_train,
         split.y_train,
         split.g_train,
-        **boost_kwargs,
+        **gamma_normal_boost_kwargs,
     )
     pred_gamma_normal_b = np.asarray(
         gamma_normal_boosted["booster"].predict(
@@ -1079,23 +1042,23 @@ def run_models(split):
         )["response_mean"],
         dtype=float,
     ).reshape(-1)
-    latent_gamma_normal_b = gamma_normal_boosted["booster"].predict(
-        data=split.x_test.astype(np.float64, copy=False),
-        group_data_pred=split.g_test.astype(np.int32, copy=False),
-        pred_latent=True,
-        predict_var=True,
-    )
-    latent_gamma_normal_b_mean = (
-        np.asarray(latent_gamma_normal_b["fixed_effect"], dtype=float).reshape(-1)
-        + np.asarray(latent_gamma_normal_b["random_effect_mean"], dtype=float).reshape(-1)
-    )
-    pred_metrics = summarize_prediction_metrics(split.y_test, pred_gamma_normal_b, split.g_test)
-    gamma_normal_boosted_test_nll = gamma_normal_mc_test_nll(
-        split.y_test,
-        latent_gamma_normal_b_mean,
-        np.asarray(latent_gamma_normal_b["random_effect_cov"], dtype=float).reshape(-1),
-        gamma_normal_boosted["alpha"],
-    )
+    pred_metrics = summarize_prediction_metrics(split.y_test, pred_gamma_normal_b)
+    pred_metrics.update(cv_rmse_mae_se(
+        split,
+        lambda train_idx, valid_idx: np.asarray(
+            fit_gamma_normal_boosted(
+                split.x_train[train_idx],
+                split.y_train[train_idx],
+                split.g_train[train_idx],
+                **gamma_normal_boost_kwargs,
+            )["booster"].predict(
+                data=split.x_train[valid_idx].astype(np.float64, copy=False),
+                group_data_pred=split.g_train[valid_idx].astype(np.int32, copy=False),
+                pred_latent=False,
+            )["response_mean"],
+            dtype=float,
+        ).reshape(-1),
+    ))
     rows.append({
         "model": "gamma_normal_gpboost_boosted",
         "alpha_hat": gamma_normal_boosted["alpha"],
@@ -1104,39 +1067,8 @@ def run_models(split):
         "mae": pred_metrics["mae"],
         "mae_se": pred_metrics["mae_se"],
         "corr": pred_metrics["corr"],
-        "corr_se": pred_metrics["corr_se"],
-        "test_nll": gamma_normal_boosted_test_nll,
-        "test_nll_se": bootstrap_group_se(
-            split.g_test,
-            lambda idx, _: gamma_normal_mc_test_nll(
-                split.y_test[idx],
-                latent_gamma_normal_b_mean[idx],
-                np.asarray(latent_gamma_normal_b["random_effect_cov"], dtype=float).reshape(-1)[idx],
-                gamma_normal_boosted["alpha"],
-            ),
-        ),
+        "corr_se": np.nan,
     })
-
-    plain_boost_kwargs = {}
-    if USE_OPTUNA:
-        best_params_plain, best_rounds_plain = tune_plain_boosting(
-            split.x_train,
-            split.y_train,
-            split.g_train,
-        )
-        plain_boost_kwargs = {
-            "num_boost_round": best_rounds_plain,
-            "learning_rate": float(best_params_plain.get("learning_rate", 0.05)),
-            "tree_params": {
-                "num_leaves": int(best_params_plain.get("num_leaves", 3)),
-                "min_data_in_leaf": int(best_params_plain.get("min_data_in_leaf", 10)),
-                "max_depth": int(best_params_plain.get("max_depth", 1)),
-                "lambda_l2": float(best_params_plain.get("lambda_l2", 0.0)),
-                "max_bin": int(best_params_plain.get("max_bin", 255)),
-                "feature_fraction": float(best_params_plain.get("feature_fraction", 1.0)),
-                "line_search_step_length": bool(best_params_plain.get("line_search_step_length", False)),
-            },
-        }
 
     plain_no_group = fit_plain_boosting_global(
         split.x_train,
@@ -1147,7 +1079,18 @@ def run_models(split):
         plain_no_group.predict(data=split.x_test.astype(np.float64, copy=False)),
         dtype=float,
     ).reshape(-1)
-    pred_metrics = summarize_prediction_metrics(split.y_test, pred_plain_no_group, split.g_test)
+    pred_metrics = summarize_prediction_metrics(split.y_test, pred_plain_no_group)
+    pred_metrics.update(cv_rmse_mae_se(
+        split,
+        lambda train_idx, valid_idx: np.asarray(
+            fit_plain_boosting_global(
+                split.x_train[train_idx],
+                split.y_train[train_idx],
+                **plain_boost_kwargs,
+            ).predict(data=split.x_train[valid_idx].astype(np.float64, copy=False)),
+            dtype=float,
+        ).reshape(-1),
+    ))
     rows.append({
         "model": "boosting_plain_no_group",
         "alpha_hat": np.nan,
@@ -1156,9 +1099,7 @@ def run_models(split):
         "mae": pred_metrics["mae"],
         "mae_se": pred_metrics["mae_se"],
         "corr": pred_metrics["corr"],
-        "corr_se": pred_metrics["corr_se"],
-        "test_nll": np.nan,
-        "test_nll_se": np.nan,
+        "corr_se": np.nan,
     })
 
     x_train_with_group = np.column_stack([split.x_train, split.g_train.astype(float)])
@@ -1174,7 +1115,19 @@ def run_models(split):
         plain_with_group.predict(data=x_test_with_group.astype(np.float64, copy=False)),
         dtype=float,
     ).reshape(-1)
-    pred_metrics = summarize_prediction_metrics(split.y_test, pred_plain_with_group, split.g_test)
+    pred_metrics = summarize_prediction_metrics(split.y_test, pred_plain_with_group)
+    pred_metrics.update(cv_rmse_mae_se(
+        split,
+        lambda train_idx, valid_idx: np.asarray(
+            fit_plain_boosting_global(
+                x_train_with_group[train_idx],
+                split.y_train[train_idx],
+                categorical_feature=[group_col_idx],
+                **plain_boost_kwargs,
+            ).predict(data=x_train_with_group[valid_idx].astype(np.float64, copy=False)),
+            dtype=float,
+        ).reshape(-1),
+    ))
     rows.append({
         "model": "boosting_plain_with_group",
         "alpha_hat": np.nan,
@@ -1183,58 +1136,7 @@ def run_models(split):
         "mae": pred_metrics["mae"],
         "mae_se": pred_metrics["mae_se"],
         "corr": pred_metrics["corr"],
-        "corr_se": pred_metrics["corr_se"],
-        "test_nll": np.nan,
-        "test_nll_se": np.nan,
-    })
-
-    global_fe = fit_global_gamma_fe(split.x_train, split.y_train, ALPHA_GRID)
-    f_global = split.x_test @ global_fe["beta"]
-    pred_global = global_fe["alpha"] * np.exp(-f_global)
-    pred_metrics = summarize_prediction_metrics(split.y_test, pred_global, split.g_test)
-    global_fe_test_nll = gamma_fe_test_nll(split.y_test, f_global, global_fe["alpha"])
-    rows.append({
-        "model": "gamma_fixed_global",
-        "alpha_hat": global_fe["alpha"],
-        "rmse": pred_metrics["rmse"],
-        "rmse_se": pred_metrics["rmse_se"],
-        "mae": pred_metrics["mae"],
-        "mae_se": pred_metrics["mae_se"],
-        "corr": pred_metrics["corr"],
-        "corr_se": pred_metrics["corr_se"],
-        "test_nll": global_fe_test_nll,
-        "test_nll_se": bootstrap_group_se(
-            split.g_test,
-            lambda idx, _: gamma_fe_test_nll(split.y_test[idx], f_global[idx], global_fe["alpha"]),
-        ),
-    })
-
-    group_models = fit_groupwise_gamma_fe(
-        split.x_train, split.y_train, split.g_train, global_fe["alpha"], global_fe["beta"]
-    )
-    pred_group = predict_groupwise_gamma_fe(
-        split.x_test, split.g_test, global_fe["alpha"], group_models, global_fe["beta"]
-    )
-    f_group = np.empty(split.x_test.shape[0], dtype=float)
-    for i, gid in enumerate(split.g_test):
-        beta = group_models.get(int(gid), global_fe["beta"])
-        f_group[i] = split.x_test[i] @ beta
-    pred_metrics = summarize_prediction_metrics(split.y_test, pred_group, split.g_test)
-    group_fe_test_nll = gamma_fe_test_nll(split.y_test, f_group, global_fe["alpha"])
-    rows.append({
-        "model": "gamma_fixed_groupwise",
-        "alpha_hat": global_fe["alpha"],
-        "rmse": pred_metrics["rmse"],
-        "rmse_se": pred_metrics["rmse_se"],
-        "mae": pred_metrics["mae"],
-        "mae_se": pred_metrics["mae_se"],
-        "corr": pred_metrics["corr"],
-        "corr_se": pred_metrics["corr_se"],
-        "test_nll": group_fe_test_nll,
-        "test_nll_se": bootstrap_group_se(
-            split.g_test,
-            lambda idx, _: gamma_fe_test_nll(split.y_test[idx], f_group[idx], global_fe["alpha"]),
-        ),
+        "corr_se": np.nan,
     })
 
     return rows
@@ -1284,7 +1186,6 @@ def main():
         "rmse", "rmse_se",
         "mae", "mae_se",
         "corr", "corr_se",
-        "test_nll", "test_nll_se",
         "alpha_hat",
     ]]
     summary = summary.sort_values(["dataset", "model"]).reset_index(drop=True)
@@ -1293,7 +1194,6 @@ def main():
         ("rmse", "rmse_se", False),
         ("mae", "mae_se", False),
         ("corr", "corr_se", True),
-        ("test_nll", "test_nll_se", False),
     ]
     for metric_col, se_col, higher_is_better in metric_specs:
         is_best, is_secondary = highlight_metric_flags(
@@ -1307,7 +1207,7 @@ def main():
 
     summary_path = os.path.join(out_dir, SUMMARY_CSV)
     summary.to_csv(summary_path, index=False)
-    display = summary[["model", "dataset", "rmse", "mae", "corr", "test_nll", "alpha_hat"]].copy()
+    display = summary[["model", "dataset", "rmse", "mae", "corr", "alpha_hat"]].copy()
     for metric_col, se_col, _ in metric_specs:
         display[metric_col] = [
             apply_highlight_markup(

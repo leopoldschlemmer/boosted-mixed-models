@@ -5,7 +5,6 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
-from scipy.special import gammaln
 from sklearn.model_selection import GroupKFold
 
 
@@ -13,7 +12,6 @@ SEED = 123
 RESULTS_DIR = "results"
 SUMMARY_CSV = "real_data_experiment_pg_summary.csv"
 USE_OPTUNA = True
-BOOTSTRAP_B = 200
 
 
 def import_gpboost():
@@ -65,25 +63,68 @@ def compute_rmspe(y_true, mu_pred):
     return float(np.sqrt(np.mean(residual))) if residual.size else np.nan
 
 
-def bootstrap_group_indices(groups, rng):
-    groups = np.asarray(groups)
-    unique_groups = np.unique(groups)
-    sampled_groups = rng.choice(unique_groups, size=len(unique_groups), replace=True)
-    parts = [np.flatnonzero(groups == g) for g in sampled_groups]
-    return np.concatenate(parts) if parts else np.array([], dtype=int)
+def fold_metric_se(values):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    return float(np.std(values) / np.sqrt(values.size)) if values.size > 1 else np.nan
 
 
-def bootstrap_metric_se(groups, metric_fn, B=BOOTSTRAP_B, seed=SEED):
-    rng = np.random.default_rng(seed)
-    vals = []
-    for _ in range(int(B)):
-        idx = bootstrap_group_indices(groups, rng)
-        val = metric_fn(idx)
-        if np.isfinite(val):
-            vals.append(float(val))
-    if len(vals) < 2:
-        return np.nan
-    return float(np.std(np.asarray(vals, dtype=float), ddof=1))
+def get_boosting_search_space(likelihood, n_obs):
+    min_leaf_upper = max(12, min(25, n_obs // 20 if n_obs >= 20 else 25))
+    common = {
+        "learning_rate": [0.03, 0.10],
+        "min_data_in_leaf": [10, min_leaf_upper],
+        "max_depth": [1, 2],
+        "num_leaves": [2, 8],
+        "lambda_l2": [0.0, 2.0],
+        "max_bin": [63, 127],
+        "feature_fraction": [0.8, 1.0],
+    }
+    if likelihood == "poisson_gamma":
+        return {
+            **common,
+            "line_search_step_length": [False, False],
+        }
+    if likelihood == "poisson":
+        return {
+            **common,
+            "line_search_step_length": [False, True],
+        }
+    raise ValueError(f"Unsupported likelihood for boosting search space: {likelihood}")
+
+
+def get_boosting_base_params(likelihood):
+    if likelihood == "poisson_gamma":
+        return {
+            "objective": "poisson_gamma",
+            "boost_from_average": False,
+            "metric": "test_neg_log_likelihood",
+            "learning_rate": 0.05,
+            "num_leaves": 3,
+            "min_data_in_leaf": 10,
+            "max_depth": 1,
+            "lambda_l2": 0.0,
+            "max_bin": 255,
+            "feature_fraction": 1.0,
+            "line_search_step_length": False,
+            "verbose": -1,
+        }
+    if likelihood == "poisson":
+        return {
+            "objective": "poisson",
+            "boost_from_average": True,
+            "metric": "poisson",
+            "learning_rate": 0.05,
+            "num_leaves": 3,
+            "min_data_in_leaf": 10,
+            "max_depth": 1,
+            "lambda_l2": 0.0,
+            "max_bin": 255,
+            "feature_fraction": 1.0,
+            "line_search_step_length": True,
+            "verbose": -1,
+        }
+    raise ValueError(f"Unsupported likelihood for boosting parameters: {likelihood}")
 
 
 def prepend_intercept(X):
@@ -104,58 +145,6 @@ def extract_response_mean(pred):
     return np.asarray(pred, dtype=float).reshape(-1)
 
 
-def group_sums(values, groups, n_groups):
-    return np.bincount(groups, weights=values, minlength=n_groups).astype(float)
-
-
-def group_sum_exp(F, groups, n_groups):
-    max_by_group = np.full(n_groups, -np.inf, dtype=float)
-    np.maximum.at(max_by_group, groups, F)
-    shifted = np.exp(F - max_by_group[groups])
-    sum_shifted = np.bincount(groups, weights=shifted, minlength=n_groups).astype(float)
-    return sum_shifted * np.exp(max_by_group)
-
-
-def poisson_gamma_nll(y, F, groups, gamma):
-    gamma = float(max(gamma, 1e-12))
-    _, inv = np.unique(groups, return_inverse=True)
-    n_groups = int(inv.max()) + 1
-    sum_y = group_sums(y, inv, n_groups)
-    sum_exp_f = group_sum_exp(F, inv, n_groups)
-    sum_y_f = group_sums(y * F, inv, n_groups)
-    sum_log_fact = group_sums(gammaln(y + 1.0), inv, n_groups)
-    gamma_prime = gamma + sum_y
-    lambda_prime = np.clip(gamma + sum_exp_f, 1e-12, None)
-    return float(np.sum(
-        -gamma * np.log(gamma)
-        + gammaln(gamma)
-        - gammaln(gamma_prime)
-        + gamma_prime * np.log(lambda_prime)
-        - sum_y_f
-        + sum_log_fact
-    ))
-
-
-def poisson_normal_nll_mc(y, F, groups, sigma2, mc_samples=2000, seed=SEED):
-    sigma2 = float(max(sigma2, 1e-12))
-    rng = np.random.default_rng(seed)
-    nll = 0.0
-    for gid in np.unique(groups):
-        mask = groups == gid
-        y_i = np.asarray(y[mask], dtype=float)
-        F_i = np.asarray(F[mask], dtype=float)
-        theta = rng.normal(0.0, np.sqrt(sigma2), size=int(mc_samples))
-        eta = theta[:, None] + F_i[None, :]
-        log_likelihood = np.sum(
-            -np.exp(eta) + eta * y_i[None, :] - gammaln(y_i[None, :] + 1.0),
-            axis=1,
-        )
-        max_log_likelihood = float(np.max(log_likelihood))
-        marginal = max_log_likelihood + np.log(np.mean(np.exp(log_likelihood - max_log_likelihood)))
-        nll -= marginal
-    return float(nll)
-
-
 def tune_boosting(X, y, groups, likelihood, n_trials=8, n_splits=5, max_rounds=150, early_stopping=15):
     gpb = get_gpb()
     folds = list(GroupKFold(n_splits=n_splits).split(X, y, groups=groups))
@@ -166,21 +155,9 @@ def tune_boosting(X, y, groups, likelihood, n_trials=8, n_splits=5, max_rounds=1
         free_raw_data=False,
     )
     gp_model.set_optim_params({"trace": False})
-    n = X.shape[0]
-    search_space = {
-        "learning_rate": [0.03, 0.10],
-        "min_data_in_leaf": [10, max(12, min(25, n // 20 if n >= 20 else 25))],
-        "max_depth": [1, 2],
-        "num_leaves": [2, 8],
-        "lambda_l2": [0.0, 2.0],
-        "max_bin": [63, 127],
-        "feature_fraction": [0.8, 1.0],
-        "line_search_step_length": [False, True],
-    }
-    if likelihood == "poisson_gamma":
-        search_space["line_search_step_length"] = [False, False]
+    search_space = get_boosting_search_space(likelihood, X.shape[0])
+    base_params = get_boosting_base_params(likelihood)
     started = time.time()
-    metric = "test_neg_log_likelihood" if likelihood == "poisson_gamma" else "poisson"
     tune_kwargs = dict(
         search_space=search_space,
         n_trials=int(n_trials),
@@ -190,15 +167,18 @@ def tune_boosting(X, y, groups, likelihood, n_trials=8, n_splits=5, max_rounds=1
         max_num_boost_round=int(max_rounds),
         early_stopping_rounds=int(early_stopping),
         folds=folds,
-        metric=metric,
+        metric=base_params["metric"],
         cv_seed=4,
         tpe_seed=1,
         verbose_eval=1,
         use_gp_model_for_validation=True,
         train_gp_model_cov_pars=True,
+        params={
+            "objective": base_params["objective"],
+            "boost_from_average": base_params["boost_from_average"],
+            "verbose": base_params["verbose"],
+        },
     )
-    if likelihood == "poisson_gamma":
-        tune_kwargs["params"] = {"objective": "poisson_gamma", "boost_from_average": False, "verbose": -1}
     opt = gpb.tune_pars_TPE_algorithm_optuna(**tune_kwargs)
     best_params = dict(opt.get("best_params", {}))
     best_rounds = int(opt.get("best_num_boost_round", opt.get("best_iter", 100)))
@@ -260,6 +240,33 @@ def append_group_categorical_feature(X, group):
     return np.column_stack([X.astype(np.float64, copy=False), group.astype(np.float64, copy=False)])
 
 
+def plain_boosting_cv_rmspe_se(split, include_group_feature, params, rounds, n_splits=5):
+    gpb = get_gpb()
+    fold_scores = []
+    folds = GroupKFold(n_splits=n_splits).split(split.X_train, split.y_train, groups=split.group_train)
+    for train_idx, valid_idx in folds:
+        if include_group_feature:
+            x_train = append_group_categorical_feature(split.X_train[train_idx], split.group_train[train_idx])
+            x_valid = append_group_categorical_feature(split.X_train[valid_idx], split.group_train[valid_idx])
+            categorical_feature = [x_train.shape[1] - 1]
+        else:
+            x_train = split.X_train[train_idx].astype(np.float64, copy=False)
+            x_valid = split.X_train[valid_idx].astype(np.float64, copy=False)
+            categorical_feature = "auto"
+        booster = gpb.train(
+            params=params,
+            train_set=gpb.Dataset(
+                x_train,
+                label=split.y_train[train_idx].astype(np.float64, copy=False),
+                categorical_feature=categorical_feature,
+            ),
+            num_boost_round=rounds,
+        )
+        mu_pred = np.asarray(booster.predict(data=x_valid), dtype=float).reshape(-1)
+        fold_scores.append(compute_rmspe(split.y_train[valid_idx], mu_pred))
+    return fold_metric_se(fold_scores)
+
+
 def fit_plain_boosting_pooled(split, include_group_feature, num_estimators=200, n_trials=8):
     gpb = get_gpb()
     if include_group_feature:
@@ -283,6 +290,7 @@ def fit_plain_boosting_pooled(split, include_group_feature, num_estimators=200, 
         "verbose": -1,
     }
     rounds = int(num_estimators)
+    rmspe_se = np.nan
     if USE_OPTUNA:
         best_params, rounds = tune_plain_boosting(
             x_train,
@@ -301,6 +309,7 @@ def fit_plain_boosting_pooled(split, include_group_feature, num_estimators=200, 
             "feature_fraction": float(best_params.get("feature_fraction", params["feature_fraction"])),
             "line_search_step_length": bool(best_params.get("line_search_step_length", False)),
         })
+        rmspe_se = plain_boosting_cv_rmspe_se(split, include_group_feature, params, rounds)
     booster = gpb.train(
         params=params,
         train_set=gpb.Dataset(
@@ -314,16 +323,9 @@ def fit_plain_boosting_pooled(split, include_group_feature, num_estimators=200, 
         booster.predict(data=x_test),
         dtype=float,
     ).reshape(-1)
-    rmspe = compute_rmspe(split.y_test, mu_pred)
-    rmspe_se = bootstrap_metric_se(
-        split.group_test,
-        lambda idx: compute_rmspe(split.y_test[idx], mu_pred[idx]),
-    )
     return {
-        "rmspe": rmspe,
+        "rmspe": compute_rmspe(split.y_test, mu_pred),
         "rmspe_se": rmspe_se,
-        "nll": np.nan,
-        "nll_se": np.nan,
     }
 
 
@@ -331,12 +333,11 @@ def fit_plain_boosting_with_group_cat(split, num_estimators=200, n_trials=8):
     return fit_plain_boosting_pooled(split, include_group_feature=True, num_estimators=num_estimators, n_trials=n_trials)
 
 
-def fit_pg_linear(split):
-    gpb = get_gpb()
+def predict_pg_linear(gpb, X_train, y_train, group_train, X_pred, group_pred):
     gp_model = gpb.GPModel(
-        group_data=split.group_train.astype(np.int32, copy=False),
+        group_data=group_train.astype(np.int32, copy=False),
         likelihood="poisson_gamma",
-        num_data=len(split.y_train),
+        num_data=len(y_train),
         free_raw_data=False,
     )
     gp_model._user_likelihood = "poisson_gamma"
@@ -347,93 +348,133 @@ def fit_pg_linear(split):
         "trace": False,
     })
     gp_model.fit(
-        y=split.y_train.astype(np.float64, copy=False),
-        X=split.X_train.astype(np.float64, copy=False),
+        y=y_train.astype(np.float64, copy=False),
+        X=X_train.astype(np.float64, copy=False),
     )
-    gamma_hat = float(np.asarray(gp_model.get_cov_pars(format_pandas=False), dtype=float).reshape(-1)[0])
-    beta_hat = np.asarray(gp_model.get_coef(format_pandas=False), dtype=float).reshape(-1)
-    F_test = split.X_test @ beta_hat
     pred = gp_model.predict(
         predict_response=True,
-        group_data_pred=split.group_test.astype(np.int32, copy=False),
-        X_pred=split.X_test.astype(np.float64, copy=False),
+        group_data_pred=group_pred.astype(np.int32, copy=False),
+        X_pred=X_pred.astype(np.float64, copy=False),
     )
-    mu_pred = np.asarray(pred["mu"], dtype=float).reshape(-1)
-    rmspe = compute_rmspe(split.y_test, mu_pred)
-    nll = poisson_gamma_nll(split.y_test, F_test, split.group_test, gamma_hat)
-    rmspe_se = bootstrap_metric_se(
-        split.group_test,
-        lambda idx: compute_rmspe(split.y_test[idx], mu_pred[idx]),
+    return np.asarray(pred["mu"], dtype=float).reshape(-1)
+
+
+def predict_pn_linear(gpb, X_train, y_train, group_train, X_pred, group_pred):
+    gp_model = gpb.GPModel(
+        group_data=group_train.astype(np.int32, copy=False),
+        likelihood="poisson",
+        num_data=len(y_train),
+        free_raw_data=False,
     )
-    nll_se = bootstrap_metric_se(
+    gp_model.fit(
+        y=y_train.astype(np.float64, copy=False),
+        X=X_train.astype(np.float64, copy=False),
+    )
+    pred = gp_model.predict(
+        predict_response=True,
+        y=y_train.astype(np.float64, copy=False),
+        group_data_pred=group_pred.astype(np.int32, copy=False),
+        X_pred=X_pred.astype(np.float64, copy=False),
+    )
+    return np.asarray(pred["mu"], dtype=float).reshape(-1)
+
+
+def linear_cv_rmspe_se(split, likelihood, n_splits=5):
+    gpb = get_gpb()
+    fold_scores = []
+    folds = GroupKFold(n_splits=n_splits).split(split.X_train, split.y_train, groups=split.group_train)
+    for train_idx, valid_idx in folds:
+        if likelihood == "poisson_gamma":
+            mu_pred = predict_pg_linear(
+                gpb,
+                split.X_train[train_idx],
+                split.y_train[train_idx],
+                split.group_train[train_idx],
+                split.X_train[valid_idx],
+                split.group_train[valid_idx],
+            )
+        else:
+            mu_pred = predict_pn_linear(
+                gpb,
+                split.X_train[train_idx],
+                split.y_train[train_idx],
+                split.group_train[train_idx],
+                split.X_train[valid_idx],
+                split.group_train[valid_idx],
+            )
+        fold_scores.append(compute_rmspe(split.y_train[valid_idx], mu_pred))
+    return fold_metric_se(fold_scores)
+
+
+def fit_pg_linear(split):
+    gpb = get_gpb()
+    mu_pred = predict_pg_linear(
+        gpb,
+        split.X_train,
+        split.y_train,
+        split.group_train,
+        split.X_test,
         split.group_test,
-        lambda idx: poisson_gamma_nll(split.y_test[idx], F_test[idx], split.group_test[idx], gamma_hat),
     )
     return {
-        "rmspe": rmspe,
-        "rmspe_se": rmspe_se,
-        "nll": nll,
-        "nll_se": nll_se,
+        "rmspe": compute_rmspe(split.y_test, mu_pred),
+        "rmspe_se": linear_cv_rmspe_se(split, "poisson_gamma"),
     }
 
 
 def fit_pn_linear(split):
     gpb = get_gpb()
-    gp_model = gpb.GPModel(
-        group_data=split.group_train.astype(np.int32, copy=False),
-        likelihood="poisson",
-        num_data=len(split.y_train),
-        free_raw_data=False,
-    )
-    gp_model.fit(
-        y=split.y_train.astype(np.float64, copy=False),
-        X=split.X_train.astype(np.float64, copy=False),
-    )
-    sigma2_hat = float(np.asarray(gp_model.get_cov_pars(format_pandas=False), dtype=float).reshape(-1)[0])
-    beta_hat = np.asarray(gp_model.get_coef(format_pandas=False), dtype=float).reshape(-1)
-    pred = gp_model.predict(
-        predict_response=True,
-        y=split.y_train.astype(np.float64, copy=False),
-        group_data_pred=split.group_test.astype(np.int32, copy=False),
-        X_pred=split.X_test.astype(np.float64, copy=False),
-    )
-    mu_pred = np.asarray(pred["mu"], dtype=float).reshape(-1)
-    F_test = split.X_test @ beta_hat
-    rmspe = compute_rmspe(split.y_test, mu_pred)
-    nll = poisson_normal_nll_mc(split.y_test, F_test, split.group_test, sigma2_hat)
-    rmspe_se = bootstrap_metric_se(
+    mu_pred = predict_pn_linear(
+        gpb,
+        split.X_train,
+        split.y_train,
+        split.group_train,
+        split.X_test,
         split.group_test,
-        lambda idx: compute_rmspe(split.y_test[idx], mu_pred[idx]),
-    )
-    nll_se = bootstrap_metric_se(
-        split.group_test,
-        lambda idx: poisson_normal_nll_mc(split.y_test[idx], F_test[idx], split.group_test[idx], sigma2_hat),
     )
     return {
-        "rmspe": rmspe,
-        "rmspe_se": rmspe_se,
-        "nll": nll,
-        "nll_se": nll_se,
+        "rmspe": compute_rmspe(split.y_test, mu_pred),
+        "rmspe_se": linear_cv_rmspe_se(split, "poisson"),
     }
+
+
+def boosted_cv_rmspe_se(split, likelihood, params, rounds, n_splits=5):
+    gpb = get_gpb()
+    fold_scores = []
+    folds = GroupKFold(n_splits=n_splits).split(split.X_train, split.y_train, groups=split.group_train)
+    for train_idx, valid_idx in folds:
+        gp_model = gpb.GPModel(
+            group_data=split.group_train[train_idx].astype(np.int32, copy=False),
+            likelihood=likelihood,
+            num_data=len(train_idx),
+            free_raw_data=False,
+        )
+        if likelihood == "poisson_gamma":
+            gp_model._user_likelihood = "poisson_gamma"
+        booster = gpb.train(
+            params=params,
+            train_set=gpb.Dataset(
+                split.X_train[train_idx].astype(np.float64, copy=False),
+                label=split.y_train[train_idx].astype(np.float64, copy=False),
+            ),
+            gp_model=gp_model,
+            use_gp_model_for_validation=False if likelihood == "poisson" else True,
+            num_boost_round=rounds,
+        )
+        pred = booster.predict(
+            data=split.X_train[valid_idx].astype(np.float64, copy=False),
+            group_data_pred=split.group_train[valid_idx].astype(np.int32, copy=False),
+            pred_latent=False,
+        )
+        fold_scores.append(compute_rmspe(split.y_train[valid_idx], extract_response_mean(pred)))
+    return fold_metric_se(fold_scores)
 
 
 def train_boosted(split, likelihood, num_estimators=200, n_trials=8):
     gpb = get_gpb()
-    params = {
-        "objective": "poisson_gamma" if likelihood == "poisson_gamma" else "poisson",
-        "boost_from_average": False if likelihood == "poisson_gamma" else True,
-        "metric": "test_neg_log_likelihood" if likelihood == "poisson_gamma" else "poisson",
-        "learning_rate": 0.05,
-        "num_leaves": 3,
-        "min_data_in_leaf": 10,
-        "max_depth": 1,
-        "lambda_l2": 0.0,
-        "max_bin": 255,
-        "feature_fraction": 1.0,
-        "line_search_step_length": False if likelihood == "poisson_gamma" else True,
-        "verbose": -1,
-    }
+    params = get_boosting_base_params(likelihood)
     rounds = int(num_estimators)
+    rmspe_se = np.nan
     if USE_OPTUNA:
         best_params, rounds = tune_boosting(split.X_train, split.y_train, split.group_train, likelihood, n_trials=n_trials)
         params.update({
@@ -444,8 +485,9 @@ def train_boosted(split, likelihood, num_estimators=200, n_trials=8):
             "lambda_l2": float(best_params.get("lambda_l2", params["lambda_l2"])),
             "max_bin": int(best_params.get("max_bin", params["max_bin"])),
             "feature_fraction": float(best_params.get("feature_fraction", params["feature_fraction"])),
-            "line_search_step_length": False if likelihood == "poisson_gamma" else bool(best_params.get("line_search_step_length", False)),
+            "line_search_step_length": bool(best_params.get("line_search_step_length", params["line_search_step_length"])),
         })
+        rmspe_se = boosted_cv_rmspe_se(split, likelihood, params, rounds)
     gp_model = gpb.GPModel(
         group_data=split.group_train.astype(np.int32, copy=False),
         likelihood=likelihood,
@@ -461,62 +503,15 @@ def train_boosted(split, likelihood, num_estimators=200, n_trials=8):
         use_gp_model_for_validation=False if likelihood == "poisson" else True,
         num_boost_round=rounds,
     )
-    F_train = np.asarray(booster.predict(
-        data=split.X_train.astype(np.float64, copy=False),
-        group_data_pred=split.group_train.astype(np.int32, copy=False),
-        pred_latent=True,
-        ignore_gp_model=True,
-    ), dtype=float).reshape(-1)
-    if likelihood == "poisson_gamma":
-        pred = booster.predict(
-            data=split.X_test.astype(np.float64, copy=False),
-            group_data_pred=split.group_test.astype(np.int32, copy=False),
-            pred_latent=False,
-        )
-        mu_pred = extract_response_mean(pred)
-        F_test = np.asarray(booster.predict(
-            data=split.X_test.astype(np.float64, copy=False),
-            group_data_pred=split.group_test.astype(np.int32, copy=False),
-            pred_latent=True,
-            ignore_gp_model=True,
-        ), dtype=float).reshape(-1)
-        gamma_hat = float(np.asarray(gp_model.get_cov_pars(format_pandas=False), dtype=float).reshape(-1)[0])
-        nll = poisson_gamma_nll(split.y_test, F_test, split.group_test, gamma_hat)
-    else:
-        pred = booster.predict(
-            data=split.X_test.astype(np.float64, copy=False),
-            group_data_pred=split.group_test.astype(np.int32, copy=False),
-            pred_latent=False,
-        )
-        mu_pred = extract_response_mean(pred)
-        F_test = np.asarray(booster.predict(
-            data=split.X_test.astype(np.float64, copy=False),
-            group_data_pred=split.group_test.astype(np.int32, copy=False),
-            pred_latent=True,
-            ignore_gp_model=True,
-        ), dtype=float).reshape(-1)
-        sigma2_hat = float(np.asarray(gp_model.get_cov_pars(format_pandas=False), dtype=float).reshape(-1)[0])
-        nll = poisson_normal_nll_mc(split.y_test, F_test, split.group_test, sigma2_hat)
-    rmspe = compute_rmspe(split.y_test, mu_pred)
-    rmspe_se = bootstrap_metric_se(
-        split.group_test,
-        lambda idx: compute_rmspe(split.y_test[idx], mu_pred[idx]),
+    pred = booster.predict(
+        data=split.X_test.astype(np.float64, copy=False),
+        group_data_pred=split.group_test.astype(np.int32, copy=False),
+        pred_latent=False,
     )
-    if likelihood == "poisson_gamma":
-        nll_se = bootstrap_metric_se(
-            split.group_test,
-            lambda idx: poisson_gamma_nll(split.y_test[idx], F_test[idx], split.group_test[idx], gamma_hat),
-        )
-    else:
-        nll_se = bootstrap_metric_se(
-            split.group_test,
-            lambda idx: poisson_normal_nll_mc(split.y_test[idx], F_test[idx], split.group_test[idx], sigma2_hat),
-        )
+    mu_pred = extract_response_mean(pred)
     return {
-        "rmspe": rmspe,
+        "rmspe": compute_rmspe(split.y_test, mu_pred),
         "rmspe_se": rmspe_se,
-        "nll": nll,
-        "nll_se": nll_se,
     }
 
 
@@ -665,8 +660,6 @@ def run_all():
                 result = fit_fn(split)
                 row[f"{model_name}_rmspe"] = result["rmspe"]
                 row[f"{model_name}_rmspe_se"] = result["rmspe_se"]
-                row[f"{model_name}_nll"] = result["nll"]
-                row[f"{model_name}_nll_se"] = result["nll_se"]
                 print(model_name, {k: round(v, 4) if np.isfinite(v) else v for k, v in result.items()}, flush=True)
             rows.append(row)
         except Exception as exc:
@@ -675,8 +668,6 @@ def run_all():
             for model_name in MODELS:
                 row[f"{model_name}_rmspe"] = np.nan
                 row[f"{model_name}_rmspe_se"] = np.nan
-                row[f"{model_name}_nll"] = np.nan
-                row[f"{model_name}_nll_se"] = np.nan
             rows.append(row)
     df = pd.DataFrame(rows).round(4)
     os.makedirs(RESULTS_DIR, exist_ok=True)
