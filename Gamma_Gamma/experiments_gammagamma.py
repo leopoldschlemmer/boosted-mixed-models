@@ -482,7 +482,16 @@ def tune_gamma_normal_boosting(x_train, y_train, g_train, n_trials=8, n_splits=5
     )
 
 
-def tune_plain_boosting(x_train, y_train, g_train, n_trials=8, n_splits=5, max_rounds=200, early_stopping=20):
+def tune_plain_boosting(
+    x_train,
+    y_train,
+    g_train,
+    n_trials=8,
+    n_splits=5,
+    max_rounds=200,
+    early_stopping=20,
+    categorical_feature="auto",
+):
     gpb = import_gpboost()
     folds = list(within_group_folds(g_train, n_splits=n_splits))
     search_space = {
@@ -509,6 +518,7 @@ def tune_plain_boosting(x_train, y_train, g_train, n_trials=8, n_splits=5, max_r
         tpe_seed=1,
         verbose_eval=1,
         params={"objective": "regression_l2", "verbose": -1},
+        categorical_feature=categorical_feature,
     )
     best_params = dict(opt.get("best_params", {}))
     best_rounds = int(opt.get("best_num_boost_round", opt.get("best_iter", 100)))
@@ -911,9 +921,14 @@ def boost_kwargs_from_params(best_params, best_rounds):
 def run_models(split):
     rows = []
 
+    x_train_with_group = np.column_stack([split.x_train, split.g_train.astype(float)])
+    x_test_with_group = np.column_stack([split.x_test, split.g_test.astype(float)])
+    group_col_idx = x_train_with_group.shape[1] - 1
+
     gg_boost_kwargs = {}
     gamma_normal_boost_kwargs = {}
-    plain_boost_kwargs = {}
+    plain_no_group_boost_kwargs = {}
+    plain_with_group_boost_kwargs = {}
     if USE_OPTUNA and USE_OPTUNA_GG_BOOSTING:
         best_params, best_rounds = tune_gg_boosting(
             split.x_train,
@@ -932,7 +947,14 @@ def run_models(split):
             split.y_train,
             split.g_train,
         )
-        plain_boost_kwargs = boost_kwargs_from_params(best_params, best_rounds)
+        plain_no_group_boost_kwargs = boost_kwargs_from_params(best_params, best_rounds)
+        best_params, best_rounds = tune_plain_boosting(
+            x_train_with_group,
+            split.y_train,
+            split.g_train,
+            categorical_feature=[group_col_idx],
+        )
+        plain_with_group_boost_kwargs = boost_kwargs_from_params(best_params, best_rounds)
 
     gg_linear = fit_gg_linear(split.x_train, split.y_train, split.g_train)
     pred = np.asarray(
@@ -1073,7 +1095,7 @@ def run_models(split):
     plain_no_group = fit_plain_boosting_global(
         split.x_train,
         split.y_train,
-        **plain_boost_kwargs,
+        **plain_no_group_boost_kwargs,
     )
     pred_plain_no_group = np.asarray(
         plain_no_group.predict(data=split.x_test.astype(np.float64, copy=False)),
@@ -1086,7 +1108,7 @@ def run_models(split):
             fit_plain_boosting_global(
                 split.x_train[train_idx],
                 split.y_train[train_idx],
-                **plain_boost_kwargs,
+                **plain_no_group_boost_kwargs,
             ).predict(data=split.x_train[valid_idx].astype(np.float64, copy=False)),
             dtype=float,
         ).reshape(-1),
@@ -1102,14 +1124,11 @@ def run_models(split):
         "corr_se": np.nan,
     })
 
-    x_train_with_group = np.column_stack([split.x_train, split.g_train.astype(float)])
-    x_test_with_group = np.column_stack([split.x_test, split.g_test.astype(float)])
-    group_col_idx = x_train_with_group.shape[1] - 1
     plain_with_group = fit_plain_boosting_global(
         x_train_with_group,
         split.y_train,
         categorical_feature=[group_col_idx],
-        **plain_boost_kwargs,
+        **plain_with_group_boost_kwargs,
     )
     pred_plain_with_group = np.asarray(
         plain_with_group.predict(data=x_test_with_group.astype(np.float64, copy=False)),
@@ -1123,7 +1142,7 @@ def run_models(split):
                 x_train_with_group[train_idx],
                 split.y_train[train_idx],
                 categorical_feature=[group_col_idx],
-                **plain_boost_kwargs,
+                **plain_with_group_boost_kwargs,
             ).predict(data=x_train_with_group[valid_idx].astype(np.float64, copy=False)),
             dtype=float,
         ).reshape(-1),

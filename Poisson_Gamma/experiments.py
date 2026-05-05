@@ -59,7 +59,6 @@ def compute_rmspe(y_true, mu_pred):
     if not np.any(valid):
         return np.nan
     residual = ((y_true[valid] - mu_pred[valid]) ** 2) / mu_pred[valid]
-    residual = residual[residual > 0]
     return float(np.sqrt(np.mean(residual))) if residual.size else np.nan
 
 
