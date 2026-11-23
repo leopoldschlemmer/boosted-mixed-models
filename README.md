@@ -1,12 +1,20 @@
 # Boosted Mixed Models
 
-This repository contains the code and paper materials for experiments on conjugate non-Gaussian mixed-effects models, in particular Poisson--Gamma and Gamma--Gamma models implemented within the GPBoost framework.
+This repository contains the code and research report for experiments on conjugate non-Gaussian mixed-effects models, in particular Poisson–Gamma and Gamma–Gamma models implemented within the GPBoost framework.
+
+These models combine information across groups while accounting for their differences, allowing predictions even for groups with few observations. The experiments include forecasting companies’ next-year total assets from US financial data.
+
+## Research Report
+
+[Read the research report (PDF)](Non_Gaussian_Mixed_Effects_Report.pdf)
+
+The report presents the mathematical derivations, implementation details, empirical results and limitations.
 
 ## Repository Structure
 
-- `Poisson_Gamma/`: code and experiments for the Poisson--Gamma models
-- `Gamma_Gamma/`: code and experiments for the Gamma--Gamma models
-- `...`: paper source and related materials
+- `Non_Gaussian_Mixed_Effects_Report.pdf`: research report
+- `Poisson_Gamma/`: code and experiments for the Poisson–Gamma models
+- `Gamma_Gamma/`: code and experiments for the Gamma–Gamma models
 
 ## Data
 
